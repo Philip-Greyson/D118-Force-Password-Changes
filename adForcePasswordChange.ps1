@@ -12,8 +12,7 @@ $constantOU = $Env:CONSTANT_OU_ENDING # the constant parts of our AD OU structur
 
 # The OUs to process. Use the full distinguished name of each OU, one per line. Only users DIRECTLY inside each OU are flagged, not users in sub-OUs
 $targetOUs = @(
-    "OU=Staff,OU=EXAMPLE BUILDING 1,$constantOU"
-    "OU=Staff,OU=EXAMPLE BUILDING 2,$constantOU"
+    "OU=Staff,OU=Example,$constantOU"
 )
 
 # Safety switch. When $true, the script only logs who WOULD be flagged without changing anything in AD
@@ -21,7 +20,8 @@ $targetOUs = @(
 $dryRun = $true
 
 $skipDisabled = $true # if $true, disabled accounts are skipped since they can't log on anyway
-$clearPasswordNeverExpires = $false # if $true, users with "Password never expires" will have that turned off so the flag can be set. If $false they are skipped with a warning
+$clearPasswordNeverExpires = $true # if $true, users with "Password never expires" will have that turned off so the flag can be set. If $false they are skipped with a warning
+$clearCannotChangePassword = $true # if $true, users with "User cannot change password" will have that turned off so they are able to change it. If $false they are skipped with a warning
 $excludedAccounts = @() # any samAccountNames that should never be flagged even if inside the OUs (service accounts, kiosk accounts, etc). Example: @("svc-papercut", "kiosk1")
 
 $syncControllers = $true # if $true, force replication between the domain controllers at the end so the flag is everywhere right away
@@ -67,7 +67,7 @@ foreach ($OUPath in $targetOUs)
     # pwdLastSet tells us if the flag is already set (0 = must change at next logon), the others are used to decide if we should skip the user
     try
     {
-        $ouUsers = Get-ADUser -Filter * -SearchBase $OUPath -SearchScope OneLevel -Properties pwdLastSet,PasswordNeverExpires,CannotChangePassword,Enabled -ErrorAction Stop
+        $ouUsers = Get-ADUser -Filter * -SearchBase $OUPath -SearchScope OneLevel -Properties pwdLastSet,PasswordNeverExpires,CannotChangePassword,Enabled,pSuDCID -ErrorAction Stop
     }
     catch
     {
@@ -83,6 +83,7 @@ foreach ($OUPath in $targetOUs)
     foreach ($adUser in $ouUsers)
     {
         $samAccountName = $adUser.SamAccountName
+        $dcid = $adUser.pSuDCID
 
         if ($processedAccounts -contains $samAccountName) # already handled this person from a duplicate OU entry
         {
@@ -114,12 +115,20 @@ foreach ($OUPath in $targetOUs)
             continue
         }
 
-        # users with "User cannot change password" would get stuck unable to log on if forced to change it, so skip them
+        # users with "User cannot change password" would get stuck unable to log on if forced to change it, so either turn it off first or skip the user
+        $needsCannotChangeCleared = $false
         if ($adUser.CannotChangePassword)
         {
-            Write-Log "WARN: Skipping $samAccountName because they have 'User cannot change password' set and would be locked out"
-            $skippedCount++
-            continue
+            if ($clearCannotChangePassword)
+            {
+                $needsCannotChangeCleared = $true # remember to clear it right before setting the flag below
+            }
+            else
+            {
+                Write-Log "WARN: Skipping $samAccountName because they have 'User cannot change password' set and would be locked out. Set `$clearCannotChangePassword = `$true to include them"
+                $skippedCount++
+                continue
+            }
         }
 
         # AD will not let the flag be set while "Password never expires" is on, so either turn it off first or skip the user
@@ -141,18 +150,34 @@ foreach ($OUPath in $targetOUs)
         # if it is a dry run, just log what would happen without making the change
         if ($dryRun)
         {
-            if ($needsNeverExpiresCleared)
+            if ($needsCannotChangeCleared -and $needsNeverExpiresCleared)
+            {
+                Write-Log "INFO: DRY RUN - would turn of BOTH 'never expires' and 'cannot change' for $samAccountName, check for service account"
+            }
+            elseif ($needsCannotChangeCleared)
+            {
+                Write-Log "INFO: DRY RUN - would turn off 'User cannot change password' for $samAccountName"
+                # Write-Log "INFO: DRY RUN - would turn off 'User cannot change password' for $dcid"
+            }
+            elseif ($needsNeverExpiresCleared)
             {
                 Write-Log "INFO: DRY RUN - would turn off 'Password never expires' for $samAccountName"
+                # Write-Log "INFO: DRY RUN - would turn off 'Password never expires' for $dcid"
             }
             Write-Log "INFO: DRY RUN - would flag $samAccountName to change password at next logon"
+            # Write-Log "INFO: DRY RUN - would flag $dcid to change password at next logon"
             $flaggedCount++
             continue
         }
-
+ 
         # actually make the changes on the account
         try
         {
+            if ($needsCannotChangeCleared)
+            {
+                Write-Log "ACTION - CANNOT CHANGE: Turning off 'User cannot change password' for $samAccountName"
+                Set-ADUser $adUser -CannotChangePassword $false -ErrorAction Stop # removes the deny permission so the user is allowed to change their own password
+            }
             if ($needsNeverExpiresCleared)
             {
                 Write-Log "ACTION - NEVER EXPIRES: Turning off 'Password never expires' for $samAccountName"
